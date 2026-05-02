@@ -11,6 +11,7 @@
 #include "audio_codec.h"
 #include "settings.h"
 #include "assets/lang_config.h"
+#include "lvgl_theme.h"
 #include "jpg/image_to_jpeg.h"
 
 #define TAG "Display"
@@ -80,7 +81,33 @@ void LvglDisplay::SetStatus(const char* status) {
         }
         return;
     }
-    lv_label_set_text(status_label_, status);
+    if (status == nullptr || status[0] == '\0' || std::strcmp(status, Lang::Strings::STANDBY) == 0) {
+        lv_label_set_text(status_label_, "");
+        lv_obj_add_flag(status_label_, LV_OBJ_FLAG_HIDDEN);
+        if (notification_label_ != nullptr) {
+            lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+        last_status_update_time_ = std::chrono::system_clock::now();
+        return;
+    }
+
+    const char* display_status = status;
+    bool use_icon_font = false;
+    if (status != nullptr && std::strcmp(status, Lang::Strings::LISTENING) == 0) {
+        display_status = FONT_AWESOME_MICROPHONE;
+        use_icon_font = true;
+    } else if (status != nullptr && std::strcmp(status, Lang::Strings::SPEAKING) == 0) {
+        display_status = FONT_AWESOME_VOLUME_HIGH;
+        use_icon_font = true;
+    }
+
+    auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+    if (lvgl_theme != nullptr) {
+        auto font = use_icon_font ? lvgl_theme->icon_font()->font() : lvgl_theme->text_font()->font();
+        lv_obj_set_style_text_font(status_label_, font, 0);
+    }
+
+    lv_label_set_text(status_label_, display_status);
     lv_obj_remove_flag(status_label_, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
 
@@ -129,23 +156,6 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
         } else if (codec->output_volume() > 0 && muted_) {
             muted_ = false;
             lv_label_set_text(mute_label_, "");
-        }
-    }
-
-    // Update time
-    if (app.GetDeviceState() == kDeviceStateIdle) {
-        if (last_status_update_time_ + std::chrono::seconds(10) < std::chrono::system_clock::now()) {
-            // Set status to clock "HH:MM"
-            time_t now = time(NULL);
-            struct tm* tm = localtime(&now);
-            // Check if the we have already set the time
-            if (tm->tm_year >= 2025 - 1900) {
-                char time_str[16];
-                strftime(time_str, sizeof(time_str), "%H:%M", tm);
-                SetStatus(time_str);
-            } else {
-                ESP_LOGW(TAG, "System time is not set, tm_year: %d", tm->tm_year);
-            }
         }
     }
 

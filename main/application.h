@@ -10,6 +10,7 @@
 #include <mutex>
 #include <deque>
 #include <memory>
+#include <atomic>
 
 #include "protocol.h"
 #include "ota.h"
@@ -140,8 +141,15 @@ private:
     bool aborted_ = false;
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
+    bool wakeup_animation_active_ = false;
+    bool stop_animation_active_ = false;
+    std::atomic<bool> playback_status_shown_ = false;
+    std::mutex response_emotion_mutex_;
+    std::string pending_response_emotion_ = "neutral";
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
+    esp_timer_handle_t wakeup_animation_timer_handle_ = nullptr;
+    esp_timer_handle_t stop_animation_timer_handle_ = nullptr;
 
 
     // Event handlers
@@ -155,6 +163,10 @@ private:
     void HandleWakeWordDetectedEvent();
     void ContinueOpenAudioChannel(ListeningMode mode);
     void ContinueWakeWordInvoke(const std::string& wake_word);
+    void StartWakeupAnimation();
+    void HandleWakeupAnimationDone();
+    void StartStopAnimation();
+    void HandleStopAnimationDone();
 
     // Activation task (runs in background)
     void ActivationTask();

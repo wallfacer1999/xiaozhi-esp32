@@ -12,6 +12,8 @@
 #include <memory>
 
 #define PREVIEW_IMAGE_DURATION_MS 5000
+#define IDLE_ANIM_INTERVAL_MS 30000
+#define IDLE_ANIM_PLAY_DURATION_MS 4000
 
 
 class LcdDisplay : public LvglDisplay {
@@ -33,10 +35,16 @@ protected:
     lv_obj_t* emoji_box_ = nullptr;
     lv_obj_t* chat_message_label_ = nullptr;
     esp_timer_handle_t preview_timer_ = nullptr;
+    esp_timer_handle_t idle_anim_interval_timer_ = nullptr;
+    esp_timer_handle_t idle_anim_stop_timer_ = nullptr;
     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
-    bool hide_subtitle_ = false;  // Control whether to hide chat messages/subtitles
+    bool hide_subtitle_ = true;  // Hide chat messages/subtitles by default.
+    bool idle_mode_enabled_ = false;
+    bool idle_anim_playing_ = false;
 
     void InitializeLcdThemes();
+    void StopIdleAnimationTimers();
+    void SetEmotionLocked(const char* emotion);
     virtual bool Lock(int timeout_ms = 0) override;
     virtual void Unlock() override;
 

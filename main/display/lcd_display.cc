@@ -17,6 +17,9 @@
 #include "board.h"
 
 #define TAG "LcdDisplay"
+#define EMOJI_SCALE_NORMAL 225   // ~88%
+#define EMOJI_BOX_SIZE 120       // keep emoji inside the visible area, no scrollbars
+#define EMOJI_OFFSET_Y 10        // leave room for top status bar
 
 LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
 LV_FONT_DECLARE(BUILTIN_ICON_FONT);
@@ -87,6 +90,42 @@ LcdDisplay::LcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_
         .skip_unhandled_events = false,
     };
     esp_timer_create(&preview_timer_args, &preview_timer_);
+
+    esp_timer_create_args_t idle_anim_interval_timer_args = {
+        .callback = [](void* arg) {
+            auto* display = static_cast<LcdDisplay*>(arg);
+            DisplayLockGuard lock(display);
+            if (!display->idle_mode_enabled_ || display->idle_anim_playing_ || display->preview_image_cached_ != nullptr) {
+                return;
+            }
+            display->idle_anim_playing_ = true;
+            display->SetEmotionLocked("idle_anim");
+            esp_timer_stop(display->idle_anim_stop_timer_);
+            ESP_ERROR_CHECK(esp_timer_start_once(display->idle_anim_stop_timer_, IDLE_ANIM_PLAY_DURATION_MS * 1000));
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "idle_anim_interval_timer",
+        .skip_unhandled_events = false,
+    };
+    esp_timer_create(&idle_anim_interval_timer_args, &idle_anim_interval_timer_);
+
+    esp_timer_create_args_t idle_anim_stop_timer_args = {
+        .callback = [](void* arg) {
+            auto* display = static_cast<LcdDisplay*>(arg);
+            DisplayLockGuard lock(display);
+            if (!display->idle_mode_enabled_) {
+                return;
+            }
+            display->idle_anim_playing_ = false;
+            display->SetEmotionLocked("idle");
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "idle_anim_stop_timer",
+        .skip_unhandled_events = false,
+    };
+    esp_timer_create(&idle_anim_stop_timer_args, &idle_anim_stop_timer_);
 }
 
 SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
@@ -285,6 +324,7 @@ MipiLcdDisplay::MipiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel
 
 LcdDisplay::~LcdDisplay() {
     SetPreviewImage(nullptr);
+    StopIdleAnimationTimers();
     
     // Clean up GIF controller
     if (gif_controller_) {
@@ -295,6 +335,12 @@ LcdDisplay::~LcdDisplay() {
     if (preview_timer_ != nullptr) {
         esp_timer_stop(preview_timer_);
         esp_timer_delete(preview_timer_);
+    }
+    if (idle_anim_interval_timer_ != nullptr) {
+        esp_timer_delete(idle_anim_interval_timer_);
+    }
+    if (idle_anim_stop_timer_ != nullptr) {
+        esp_timer_delete(idle_anim_stop_timer_);
     }
 
     if (preview_image_ != nullptr) {
@@ -370,6 +416,8 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_font(screen, text_font, 0);
     lv_obj_set_style_text_color(screen, lvgl_theme->text_color(), 0);
     lv_obj_set_style_bg_color(screen, lvgl_theme->background_color(), 0);
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(screen, LV_SCROLLBAR_MODE_OFF);
 
     /* Container */
     container_ = lv_obj_create(screen);
@@ -381,6 +429,8 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_pad_row(container_, 0, 0);
     lv_obj_set_style_bg_color(container_, lvgl_theme->background_color(), 0);
     lv_obj_set_style_border_color(container_, lvgl_theme->border_color(), 0);
+    lv_obj_clear_flag(container_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(container_, LV_SCROLLBAR_MODE_OFF);
 
     /* Layer 1: Top bar - for status icons */
     top_bar_ = lv_obj_create(container_);
@@ -819,6 +869,8 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_font(screen, text_font, 0);
     lv_obj_set_style_text_color(screen, lvgl_theme->text_color(), 0);
     lv_obj_set_style_bg_color(screen, lvgl_theme->background_color(), 0);
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(screen, LV_SCROLLBAR_MODE_OFF);
 
     /* Container - used as background */
     container_ = lv_obj_create(screen);
@@ -828,14 +880,18 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_border_width(container_, 0, 0);
     lv_obj_set_style_bg_color(container_, lvgl_theme->background_color(), 0);
     lv_obj_set_style_border_color(container_, lvgl_theme->border_color(), 0);
+    lv_obj_clear_flag(container_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(container_, LV_SCROLLBAR_MODE_OFF);
 
     /* Bottom layer: emoji_box_ - centered display */
     emoji_box_ = lv_obj_create(screen);
-    lv_obj_set_size(emoji_box_, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_size(emoji_box_, EMOJI_BOX_SIZE, EMOJI_BOX_SIZE);
     lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_TRANSP, 0);
     lv_obj_set_style_pad_all(emoji_box_, 0, 0);
     lv_obj_set_style_border_width(emoji_box_, 0, 0);
-    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(emoji_box_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(emoji_box_, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, EMOJI_OFFSET_Y);
 
     emoji_label_ = lv_label_create(emoji_box_);
     lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);
@@ -844,6 +900,9 @@ void LcdDisplay::SetupUI() {
 
     emoji_image_ = lv_img_create(emoji_box_);
     lv_obj_center(emoji_image_);
+    lv_image_set_scale(emoji_image_, EMOJI_SCALE_NORMAL);
+    lv_obj_clear_flag(emoji_image_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(emoji_image_, LV_SCROLLBAR_MODE_OFF);
     lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
 
     /* Middle layer: preview_image_ - centered display */
@@ -1082,55 +1141,31 @@ void LcdDisplay::SetEmotion(const char* emotion) {
         return;
     }
 
-    auto emoji_collection = static_cast<LvglTheme*>(current_theme_)->emoji_collection();
-    auto image = emoji_collection != nullptr ? emoji_collection->GetEmojiImage(emotion) : nullptr;
-    if (image == nullptr) {
-        const char* utf8 = font_awesome_get_utf8(emotion);
-        if (utf8 != nullptr && emoji_label_ != nullptr) {
-            DisplayLockGuard lock(this);
-            if (gif_controller_) {
-                gif_controller_->Stop();
-                gif_controller_.reset();
-            }
-            lv_label_set_text(emoji_label_, utf8);
-            lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_remove_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
-        }
-        return;
-    }
-
     DisplayLockGuard lock(this);
-    // Stop any running GIF animation in the same lock scope as setting new image
-    // to prevent LVGL from accessing freed image data between operations
-    if (gif_controller_) {
-        gif_controller_->Stop();
-        gif_controller_.reset();
-    }
-    if (image->IsGif()) {
-        // Create new GIF controller
-        gif_controller_ = std::make_unique<LvglGif>(image->image_dsc());
-        
-        if (gif_controller_->IsLoaded()) {
-            // Set up frame update callback
-            gif_controller_->SetFrameCallback([this]() {
-                lv_image_set_src(emoji_image_, gif_controller_->image_dsc());
-            });
-            
-            // Set initial frame and start animation
-            lv_image_set_src(emoji_image_, gif_controller_->image_dsc());
-            gif_controller_->Start();
-            
-            // Show GIF, hide others
-            lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_remove_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
-        } else {
-            ESP_LOGE(TAG, "Failed to load GIF for emotion: %s", emotion);
-            gif_controller_.reset();
+    if (strcmp(emotion, "idle") == 0) {
+        idle_mode_enabled_ = true;
+        idle_anim_playing_ = false;
+        if (idle_anim_interval_timer_ != nullptr) {
+            esp_timer_stop(idle_anim_interval_timer_);
+            ESP_ERROR_CHECK(esp_timer_start_periodic(idle_anim_interval_timer_, IDLE_ANIM_INTERVAL_MS * 1000));
+        }
+        if (idle_anim_stop_timer_ != nullptr) {
+            esp_timer_stop(idle_anim_stop_timer_);
+        }
+        SetEmotionLocked("idle");
+    } else if (strcmp(emotion, "idle_anim") == 0) {
+        idle_mode_enabled_ = true;
+        idle_anim_playing_ = true;
+        SetEmotionLocked("idle_anim");
+        if (idle_anim_stop_timer_ != nullptr) {
+            esp_timer_stop(idle_anim_stop_timer_);
+            ESP_ERROR_CHECK(esp_timer_start_once(idle_anim_stop_timer_, IDLE_ANIM_PLAY_DURATION_MS * 1000));
         }
     } else {
-        lv_image_set_src(emoji_image_, image->image_dsc());
-        lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_remove_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+        idle_mode_enabled_ = false;
+        idle_anim_playing_ = false;
+        StopIdleAnimationTimers();
+        SetEmotionLocked(emotion);
     }
 
 #if CONFIG_USE_WECHAT_MESSAGE_STYLE
@@ -1147,6 +1182,62 @@ void LcdDisplay::SetEmotion(const char* emotion) {
         lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
     }
 #endif
+}
+
+void LcdDisplay::StopIdleAnimationTimers() {
+    if (idle_anim_interval_timer_ != nullptr) {
+        esp_timer_stop(idle_anim_interval_timer_);
+    }
+    if (idle_anim_stop_timer_ != nullptr) {
+        esp_timer_stop(idle_anim_stop_timer_);
+    }
+}
+
+void LcdDisplay::SetEmotionLocked(const char* emotion) {
+    auto emoji_collection = static_cast<LvglTheme*>(current_theme_)->emoji_collection();
+    auto image = emoji_collection != nullptr ? emoji_collection->GetEmojiImage(emotion) : nullptr;
+    if (image == nullptr) {
+        const char* utf8 = font_awesome_get_utf8(emotion);
+        if (utf8 != nullptr && emoji_label_ != nullptr) {
+            if (gif_controller_) {
+                gif_controller_->Stop();
+                gif_controller_.reset();
+            }
+            lv_label_set_text(emoji_label_, utf8);
+            lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+    }
+
+    // Stop any running GIF animation in the same lock scope as setting new image
+    // to prevent LVGL from accessing freed image data between operations
+    if (gif_controller_) {
+        gif_controller_->Stop();
+        gif_controller_.reset();
+    }
+    if (image->IsGif()) {
+        gif_controller_ = std::make_unique<LvglGif>(image->image_dsc());
+        if (gif_controller_->IsLoaded()) {
+            gif_controller_->SetFrameCallback([this]() {
+                lv_image_set_src(emoji_image_, gif_controller_->image_dsc());
+                lv_image_set_scale(emoji_image_, EMOJI_SCALE_NORMAL);
+            });
+            lv_image_set_src(emoji_image_, gif_controller_->image_dsc());
+            lv_image_set_scale(emoji_image_, EMOJI_SCALE_NORMAL);
+            gif_controller_->Start();
+            lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            ESP_LOGE(TAG, "Failed to load GIF for emotion: %s", emotion);
+            gif_controller_.reset();
+        }
+    } else {
+        lv_image_set_src(emoji_image_, image->image_dsc());
+        lv_image_set_scale(emoji_image_, EMOJI_SCALE_NORMAL);
+        lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 void LcdDisplay::SetTheme(Theme* theme) {

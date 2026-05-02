@@ -98,6 +98,15 @@ bool CustomWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) 
         ParseWakenetModelConfig();
     }
 
+#ifdef CONFIG_CUSTOM_WAKE_WORD
+    // The generated assets support one Kconfig wake word. Register both requested
+    // phrases here so either one can wake the device.
+    threshold_ = CONFIG_CUSTOM_WAKE_WORD_THRESHOLD / 100.0f;
+    commands_.clear();
+    commands_.push_back({"xiao ma a", "小马啊", "wake"});
+    commands_.push_back({"xiao ma xiao ma", "小马小马", "wake"});
+#endif
+
     if (models_ == nullptr || models_->num == -1) {
         ESP_LOGE(TAG, "Failed to initialize wakenet model");
         return false;

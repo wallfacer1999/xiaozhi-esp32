@@ -18,6 +18,8 @@
 #include <font_awesome.h>
 
 #define TAG "Application"
+#define WAKEUP_ANIMATION_HOLD_MS 3000
+#define STOP_ANIMATION_HOLD_MS 3000
 
 
 Application::Application() {
@@ -44,12 +46,48 @@ Application::Application() {
         .skip_unhandled_events = true
     };
     esp_timer_create(&clock_timer_args, &clock_timer_handle_);
+
+    esp_timer_create_args_t wakeup_animation_timer_args = {
+        .callback = [](void* arg) {
+            Application* app = (Application*)arg;
+            app->Schedule([app]() {
+                app->HandleWakeupAnimationDone();
+            });
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "wakeup_anim_timer",
+        .skip_unhandled_events = true
+    };
+    esp_timer_create(&wakeup_animation_timer_args, &wakeup_animation_timer_handle_);
+
+    esp_timer_create_args_t stop_animation_timer_args = {
+        .callback = [](void* arg) {
+            Application* app = (Application*)arg;
+            app->Schedule([app]() {
+                app->HandleStopAnimationDone();
+            });
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "stop_anim_timer",
+        .skip_unhandled_events = true
+    };
+    esp_timer_create(&stop_animation_timer_args, &stop_animation_timer_handle_);
 }
 
 Application::~Application() {
     if (clock_timer_handle_ != nullptr) {
         esp_timer_stop(clock_timer_handle_);
         esp_timer_delete(clock_timer_handle_);
+    }
+    if (wakeup_animation_timer_handle_ != nullptr) {
+        esp_timer_stop(wakeup_animation_timer_handle_);
+        esp_timer_delete(wakeup_animation_timer_handle_);
+    }
+    if (stop_animation_timer_handle_ != nullptr) {
+        esp_timer_stop(stop_animation_timer_handle_);
+        esp_timer_delete(stop_animation_timer_handle_);
     }
     vEventGroupDelete(event_group_);
 }
@@ -477,13 +515,15 @@ void Application::InitializeProtocol() {
 
     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
 
-    if (ota_->HasMqttConfig()) {
-        protocol_ = std::make_unique<MqttProtocol>();
-    } else if (ota_->HasWebsocketConfig()) {
+    // Prefer WebSocket when both are provided in OTA config.
+    // Many self-hosted setups only implement WebSocket fully.
+    if (ota_->HasWebsocketConfig()) {
         protocol_ = std::make_unique<WebsocketProtocol>();
-    } else {
-        ESP_LOGW(TAG, "No protocol specified in the OTA config, using MQTT");
+    } else if (ota_->HasMqttConfig()) {
         protocol_ = std::make_unique<MqttProtocol>();
+    } else {
+        ESP_LOGW(TAG, "No protocol specified in OTA config, using WebSocket fallback");
+        protocol_ = std::make_unique<WebsocketProtocol>();
     }
 
     protocol_->OnConnected([this]() {
@@ -495,8 +535,21 @@ void Application::InitializeProtocol() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
     });
     
-    protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
+    protocol_->OnIncomingAudio([this, display](std::unique_ptr<AudioStreamPacket> packet) {
         if (GetDeviceState() == kDeviceStateSpeaking) {
+            if (!playback_status_shown_.exchange(true)) {
+                std::string response_emotion;
+                {
+                    std::lock_guard<std::mutex> lock(response_emotion_mutex_);
+                    response_emotion = pending_response_emotion_;
+                }
+                Schedule([this, display, response_emotion = std::move(response_emotion)]() {
+                    display->SetStatus(Lang::Strings::SPEAKING);
+                    if (!wakeup_animation_active_ && !stop_animation_active_) {
+                        display->SetEmotion(response_emotion.c_str());
+                    }
+                });
+            }
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
         }
     });
@@ -515,6 +568,7 @@ void Application::InitializeProtocol() {
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
             SetDeviceState(kDeviceStateIdle);
+            StartStopAnimation();
         });
     });
     
@@ -526,6 +580,11 @@ void Application::InitializeProtocol() {
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this]() {
                     aborted_ = false;
+                    playback_status_shown_ = false;
+                    {
+                        std::lock_guard<std::mutex> lock(response_emotion_mutex_);
+                        pending_response_emotion_ = "neutral";
+                    }
                     SetDeviceState(kDeviceStateSpeaking);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
@@ -553,14 +612,25 @@ void Application::InitializeProtocol() {
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
                 Schedule([display, message = std::string(text->valuestring)]() {
                     display->SetChatMessage("user", message.c_str());
+                    display->SetStatus("");
+                    display->SetEmotion("thinking");
                 });
             }
         } else if (strcmp(type->valuestring, "llm") == 0) {
             auto emotion = cJSON_GetObjectItem(root, "emotion");
             if (cJSON_IsString(emotion)) {
-                Schedule([display, emotion_str = std::string(emotion->valuestring)]() {
-                    display->SetEmotion(emotion_str.c_str());
-                });
+                std::string emotion_str = emotion->valuestring;
+                {
+                    std::lock_guard<std::mutex> lock(response_emotion_mutex_);
+                    pending_response_emotion_ = emotion_str;
+                }
+                if (GetDeviceState() == kDeviceStateSpeaking && playback_status_shown_.load()) {
+                    Schedule([this, display, emotion_str = std::move(emotion_str)]() {
+                        if (!wakeup_animation_active_ && !stop_animation_active_) {
+                            display->SetEmotion(emotion_str.c_str());
+                        }
+                    });
+                }
             }
         } else if (strcmp(type->valuestring, "mcp") == 0) {
             auto payload = cJSON_GetObjectItem(root, "payload");
@@ -654,7 +724,7 @@ void Application::DismissAlert() {
     if (GetDeviceState() == kDeviceStateIdle) {
         auto display = Board::GetInstance().GetDisplay();
         display->SetStatus(Lang::Strings::STANDBY);
-        display->SetEmotion("neutral");
+        display->SetEmotion("idle");
         display->SetChatMessage("system", "");
     }
 }
@@ -770,6 +840,7 @@ void Application::HandleStopListeningEvent() {
             protocol_->SendStopListening();
         }
         SetDeviceState(kDeviceStateIdle);
+        StartStopAnimation();
     }
 }
 
@@ -785,6 +856,7 @@ void Application::HandleWakeWordDetectedEvent() {
     if (state == kDeviceStateIdle) {
         audio_service_.EncodeWakeWord();
         auto wake_word = audio_service_.GetLastWakeWord();
+        StartWakeupAnimation();
 
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
@@ -806,11 +878,13 @@ void Application::HandleWakeWordDetectedEvent() {
             protocol_->SendStartListening(GetDefaultListeningMode());
             audio_service_.ResetDecoder();
             audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
+            StartWakeupAnimation();
             // Re-enable wake word detection as it was stopped by the detection itself
             audio_service_.EnableWakeWordDetection(true);
         } else {
             // Play popup sound and start listening again
             play_popup_on_listening_ = true;
+            StartWakeupAnimation();
             SetListeningMode(GetDefaultListeningMode());
         }
     } else if (state == kDeviceStateActivating) {
@@ -863,18 +937,24 @@ void Application::HandleStateChangedEvent() {
         case kDeviceStateIdle:
             display->SetStatus(Lang::Strings::STANDBY);
             display->ClearChatMessages();  // Clear messages first
-            display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)
+            if (!stop_animation_active_) {
+                display->SetEmotion("idle"); // Then set emotion (wechat mode checks child count)
+            }
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);
-            display->SetEmotion("neutral");
+            if (!wakeup_animation_active_ && !stop_animation_active_) {
+                display->SetEmotion("neutral");
+            }
             display->SetChatMessage("system", "");
             break;
         case kDeviceStateListening:
             display->SetStatus(Lang::Strings::LISTENING);
-            display->SetEmotion("neutral");
+            if (!wakeup_animation_active_) {
+                display->SetEmotion("neutral");
+            }
 
             // Make sure the audio processor is running
             if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
@@ -904,8 +984,6 @@ void Application::HandleStateChangedEvent() {
             }
             break;
         case kDeviceStateSpeaking:
-            display->SetStatus(Lang::Strings::SPEAKING);
-
             if (listening_mode_ != kListeningModeRealtime) {
                 audio_service_.EnableVoiceProcessing(false);
                 // Only AFE wake word can be detected in speaking mode
@@ -920,6 +998,52 @@ void Application::HandleStateChangedEvent() {
         default:
             // Do nothing
             break;
+    }
+}
+
+void Application::StartWakeupAnimation() {
+    stop_animation_active_ = false;
+    if (stop_animation_timer_handle_ != nullptr) {
+        esp_timer_stop(stop_animation_timer_handle_);
+    }
+    wakeup_animation_active_ = true;
+    Board::GetInstance().GetDisplay()->SetEmotion("wakeup");
+    if (wakeup_animation_timer_handle_ != nullptr) {
+        esp_timer_stop(wakeup_animation_timer_handle_);
+        ESP_ERROR_CHECK(esp_timer_start_once(wakeup_animation_timer_handle_, WAKEUP_ANIMATION_HOLD_MS * 1000));
+    }
+}
+
+void Application::HandleWakeupAnimationDone() {
+    if (!wakeup_animation_active_) {
+        return;
+    }
+    wakeup_animation_active_ = false;
+    if (GetDeviceState() == kDeviceStateListening) {
+        Board::GetInstance().GetDisplay()->SetEmotion("neutral");
+    }
+}
+
+void Application::StartStopAnimation() {
+    wakeup_animation_active_ = false;
+    if (wakeup_animation_timer_handle_ != nullptr) {
+        esp_timer_stop(wakeup_animation_timer_handle_);
+    }
+    stop_animation_active_ = true;
+    Board::GetInstance().GetDisplay()->SetEmotion("stop");
+    if (stop_animation_timer_handle_ != nullptr) {
+        esp_timer_stop(stop_animation_timer_handle_);
+        ESP_ERROR_CHECK(esp_timer_start_once(stop_animation_timer_handle_, STOP_ANIMATION_HOLD_MS * 1000));
+    }
+}
+
+void Application::HandleStopAnimationDone() {
+    if (!stop_animation_active_) {
+        return;
+    }
+    stop_animation_active_ = false;
+    if (GetDeviceState() == kDeviceStateIdle) {
+        Board::GetInstance().GetDisplay()->SetEmotion("idle");
     }
 }
 
@@ -1113,4 +1237,3 @@ void Application::ResetProtocol() {
         protocol_.reset();
     });
 }
-
