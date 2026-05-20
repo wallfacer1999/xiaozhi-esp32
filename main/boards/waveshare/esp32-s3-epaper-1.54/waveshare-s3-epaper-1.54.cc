@@ -77,6 +77,7 @@ class CustomBoard : public WifiBoard {
         lcd_spi_data.spi_host         = EPD_SPI_NUM;
         lcd_spi_data.buffer_len       = 5000;
         display_                      = new CustomLcdDisplay(NULL, NULL, EXAMPLE_LCD_WIDTH, EXAMPLE_LCD_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY, lcd_spi_data);
+        display_->SetHideSubtitle(false);
     }
 
     void Power_Init() {
@@ -153,6 +154,11 @@ class CustomBoard : public WifiBoard {
 
     virtual AudioCodec *GetAudioCodec() override {
         static Es8311AudioCodec audio_codec(i2c_bus_, I2C_NUM_0, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE, AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN, AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR);
+        static bool volume_initialized = false;
+        if (!volume_initialized) {
+            audio_codec.SetOutputVolume(70);
+            volume_initialized = true;
+        }
         return &audio_codec;
     }
 
